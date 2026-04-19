@@ -1,0 +1,156 @@
+// Package handler provides generic, typed execution wrappers for LLM tool calls.
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/v8tix/mcp-toolkit/model"
+	"github.com/v8tix/mcp-toolkit/schema"
+)
+
+// ErrInvalidArguments is returned by Execute when the raw JSON arguments
+// cannot be unmarshalled into the tool's typed input struct.
+//
+// This sentinel lets the observable layer (observable.ExecuteRx) stop retrying
+// immediately — retrying the same malformed bytes will always produce the same
+// unmarshal error, so consuming the retry budget is wasteful.
+//
+// Use errors.Is(err, handler.ErrInvalidArguments) to detect this case.
+var ErrInvalidArguments = errors.New("invalid arguments")
+
+// ToolHandler is the typed execution function every executable tool implements.
+//
+// In is the args struct populated by JSON-unmarshalling the LLM's tool-call
+// arguments. Its fields map 1:1 to the tool's JSON Schema properties — the
+// same struct drives both the schema (via NewTool) and the function signature.
+//
+// Out is the result type returned to the agent loop.
+type ToolHandler[In any, Out any] func(ctx context.Context, in In) (Out, error)
+
+// ExecutableTool extends model.Tool with an Execute method.
+//
+// The agent dispatch loop type-asserts to ExecutableTool after looking up a
+// tool by name in the Registry:
+//
+//	tool, ok := reg.ByName(call.Function.Name)
+//	exec, ok := tool.(handler.ExecutableTool)
+//	result, err := exec.Execute(ctx, call.Function.Arguments)
+//
+// Use NewTool to construct an ExecutableTool from a typed ToolHandler.
+type ExecutableTool interface {
+	model.Tool
+	// Execute unmarshals rawArgs into the tool's typed In struct, calls the
+	// handler, and returns (result, error).
+	Execute(ctx context.Context, rawArgs json.RawMessage) (any, error)
+}
+
+// typedTool[In, Out] is the private, generic implementation of ExecutableTool.
+type typedTool[In any, Out any] struct {
+	def     model.ToolDefinition
+	handler ToolHandler[In, Out]
+}
+
+var _ ExecutableTool = (*typedTool[struct{}, struct{}])(nil)
+
+func (t *typedTool[In, Out]) Definition() model.ToolDefinition { return t.def }
+
+func (t *typedTool[In, Out]) Execute(ctx context.Context, rawArgs json.RawMessage) (any, error) {
+	var in In
+	if err := json.Unmarshal(rawArgs, &in); err != nil {
+		return nil, fmt.Errorf("tool %q: %w: %w", t.def.Function.Name, ErrInvalidArguments, err)
+	}
+	out, err := t.handler(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// NewTool creates an ExecutableTool from a name, description, and typed handler.
+//
+// The JSON Schema is derived once at construction time from In's struct tags
+// (json, desc, enum) via model.NewInputSchemaFromStruct. Strict mode is always
+// enabled. Panics if In is not a struct (or *struct).
+//
+// Example:
+//
+//	type SearchArgs struct {
+//	    Query string `json:"query" desc:"The search query."`
+//	}
+//	tool := handler.NewTool("search_web", "Search the web.",
+//	    func(ctx context.Context, in SearchArgs) ([]Result, error) {
+//	        return repo.Search(ctx, in.Query)
+//	    },
+//	)
+func NewTool[In any, Out any](name, description string, handler ToolHandler[In, Out]) ExecutableTool {
+	var zero In
+	return &typedTool[In, Out]{
+		def:     schema.NewStrictTool(name, description, zero),
+		handler: handler,
+	}
+}
+
+// NewToolWithDefinition creates an ExecutableTool using a caller-supplied
+// ToolDefinition instead of deriving one from In's struct tags.
+// Use this when you need non-strict mode, custom descriptions, or a schema
+// that cannot be expressed via struct tags alone.
+//
+//	def := schema.FormatToolDefinition("search_web", "Search.", params, false)
+//	tool := handler.NewToolWithDefinition(def, func(ctx context.Context, in SearchArgs) ([]Result, error) {
+//	    return repo.Search(ctx, in.Query)
+//	})
+func NewToolWithDefinition[In any, Out any](def model.ToolDefinition, handler ToolHandler[In, Out]) ExecutableTool {
+	return &typedTool[In, Out]{def: def, handler: handler}
+}
+
+// ── Decorator pattern ────────────────────────────────────────────────────────
+
+// ExecuteFunc is the signature of the next hop in a middleware chain.
+type ExecuteFunc func(ctx context.Context, rawArgs json.RawMessage) (any, error)
+
+// ToolMiddleware is a function that wraps an Execute call.
+// Middleware can add logging, retry, timeout, tracing, etc. without modifying
+// the underlying tool.
+//
+// Example — a simple logger middleware:
+//
+//	func WithLogging(log func(string, ...any)) handler.ToolMiddleware {
+//	    return func(ctx context.Context, rawArgs json.RawMessage, next handler.ExecuteFunc) (any, error) {
+//	        log("tool call", "args", string(rawArgs))
+//	        result, err := next(ctx, rawArgs)
+//	        if err != nil { log("tool error", "error", err) }
+//	        return result, err
+//	    }
+//	}
+type ToolMiddleware func(ctx context.Context, rawArgs json.RawMessage, next ExecuteFunc) (any, error)
+
+// wrappedTool is the private Decorator implementation produced by Wrap.
+type wrappedTool struct {
+	inner      ExecutableTool
+	middleware ToolMiddleware
+}
+
+var _ ExecutableTool = (*wrappedTool)(nil)
+
+func (w *wrappedTool) Definition() model.ToolDefinition { return w.inner.Definition() }
+func (w *wrappedTool) Execute(ctx context.Context, rawArgs json.RawMessage) (any, error) {
+	return w.middleware(ctx, rawArgs, w.inner.Execute)
+}
+
+// Wrap applies a ToolMiddleware around an ExecutableTool's Execute method.
+// The inner tool's Definition() is forwarded unchanged.
+//
+// Multiple decorators can be stacked by wrapping the result of one Wrap call
+// with another. The last Wrap call is outermost (executes first).
+//
+// Example:
+//
+//	tool := handler.NewTool("search_web", "...", myHandler)
+//	tool = handler.Wrap(tool, withTimeout(5*time.Second))
+//	tool = handler.Wrap(tool, withLogging(log.Printf))
+func Wrap(inner ExecutableTool, middleware ToolMiddleware) ExecutableTool {
+	return &wrappedTool{inner: inner, middleware: middleware}
+}
