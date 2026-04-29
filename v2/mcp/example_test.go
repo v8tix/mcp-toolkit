@@ -36,12 +36,31 @@ func ExampleNewTools() {
 		{Name: "translate", Description: "Translate."},
 	}
 
-	tools := mcp.NewTools(discovered, exampleSession{}).WithMaxRetries(0).Build()
+	tools := mcp.NewTools(discovered, exampleSession{}).Build()
 	reg := registry.New(tools...)
 
 	fmt.Println(reg.Names())
 	// Output:
 	// [search_web translate]
+}
+
+func ExampleToolsBuilder_BuildMap() {
+	discovered := []*sdkmcp.Tool{
+		{Name: "tavily-search", Description: "Search."},
+		{Name: "tavily-crawl", Description: "Crawl."},
+		{Name: "tavily-map", Description: "Map."},
+	}
+
+	tools := mcp.NewTools(discovered, exampleSession{}).BuildMap()
+	reg := registry.New(
+		tools["tavily-search"].WithMaxRetries(5),
+		tools["tavily-crawl"].WithMaxRetries(2),
+		tools["tavily-map"],
+	)
+
+	fmt.Println(reg.Names())
+	// Output:
+	// [tavily-search tavily-crawl tavily-map]
 }
 
 func ExampleBuilder_WithDefinition() {

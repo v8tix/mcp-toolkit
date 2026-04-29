@@ -309,17 +309,17 @@ func TestNewTool_Execute_ForwardsToSession(t *testing.T) {
 	assert.Equal(t, `{"result":"ok"}`, result)
 }
 
-func TestNewTool_ExecuteRx_TransientError_Retried(t *testing.T) {
+func TestNewTool_ExecuteRx_WithoutOptions_DoesNotRetry(t *testing.T) {
 	sentinel := errors.New("transient network error")
 	session := &retryStubSession{failUntil: 2, sentinel: sentinel}
 	tool := mcp.NewTool(mcpToolDef("t", "d", nil, nil), session)
 
 	result, err := executeRx(context.Background(), tool, json.RawMessage(`{}`))
 
-	require.NoError(t, err, "result must succeed after retries")
-	assert.Equal(t, "recovered", result)
-	assert.Equal(t, int32(3), session.calls.Load(),
-		"session must be called 3 times: 2 failures + 1 success")
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Equal(t, int32(1), session.calls.Load(),
+		"session must be called exactly once when no retry options are configured")
 }
 
 func TestNewTool_WithMaxRetries_0_NoRetry(t *testing.T) {
