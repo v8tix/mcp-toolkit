@@ -259,6 +259,73 @@ func TestNewTools_EmptySlice(t *testing.T) {
 	assert.Len(t, tools, 0)
 }
 
+// ── ToolsBuilder.BuildMap ─────────────────────────────────────────────────────
+
+func TestBuildMap_KeysMatchToolNames(t *testing.T) {
+	m := NewTools([]*sdkmcp.Tool{
+		mcpTool("search", "Search.", nil),
+		mcpTool("crawl", "Crawl.", nil),
+		mcpTool("map", "Map.", nil),
+	}, &mockSession{}).WithMaxRetries(0).BuildMap()
+
+	assert.Len(t, m, 3)
+	for _, name := range []string{"search", "crawl", "map"} {
+		tool, ok := m[name]
+		assert.True(t, ok, "key %q missing", name)
+		assert.Equal(t, name, tool.Definition().Name)
+	}
+}
+
+func TestBuildMap_AllowsPerToolConfiguration(t *testing.T) {
+	m := NewTools([]*sdkmcp.Tool{
+		mcpTool("search", "Search.", nil),
+		mcpTool("crawl", "Crawl.", nil),
+	}, &mockSession{}).BuildMap()
+
+	search := m["search"].WithMaxRetries(5)
+	crawl := m["crawl"].WithMaxRetries(2)
+
+	assert.Equal(t, "search", search.Definition().Name)
+	assert.Equal(t, "crawl", crawl.Definition().Name)
+}
+
+func TestBuildMap_EmptySlice(t *testing.T) {
+	m := NewTools(nil, &mockSession{}).BuildMap()
+	assert.Empty(t, m)
+}
+
+func TestBuildMap_ToolsAreIndependent(t *testing.T) {
+	m := NewTools([]*sdkmcp.Tool{
+		mcpTool("a", "A.", nil),
+		mcpTool("b", "B.", nil),
+	}, &mockSession{}).WithMaxRetries(0).BuildMap()
+
+	assert.NotSame(t, m["a"], m["b"])
+	assert.Equal(t, "a", m["a"].Definition().Name)
+	assert.Equal(t, "b", m["b"].Definition().Name)
+}
+
+func TestBuildMap_OptionsApplied(t *testing.T) {
+	called := 0
+	onRetry := func(_ uint64, _ error) { called++ }
+
+	transientErr := errors.New("transient")
+	m := NewTools([]*sdkmcp.Tool{
+		mcpTool("flaky", "Flaky tool.", nil),
+	}, &mockSession{fn: func(_ context.Context, _ *sdkmcp.CallToolParams) (*sdkmcp.CallToolResult, error) {
+		return nil, transientErr
+	}}).
+		WithMaxRetries(2).
+		With(observable.WithOnRetry(onRetry)).
+		BuildMap()
+
+	tool, ok := m["flaky"]
+	require.True(t, ok)
+
+	<-tool.ExecuteRx(context.Background(), json.RawMessage(`{}`)).Observe()
+	assert.Equal(t, 3, called) // initial attempt + 2 retries = 3 onRetry calls
+}
+
 // ── Builder.WithDefinition / WithDefinitionFunc ───────────────────────────────
 
 func TestBuilder_WithDefinition_OverridesDefault(t *testing.T) {

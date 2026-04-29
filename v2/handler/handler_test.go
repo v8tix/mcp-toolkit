@@ -269,6 +269,29 @@ func TestWrap_StackingPreservesOrder(t *testing.T) {
 	assert.Equal(t, []string{"B:before", "A:before", "A:after", "B:after"}, callOrder)
 }
 
+func TestWrappedTool_Wrap_ChainsMiddlewareInOrder(t *testing.T) {
+	inner := NewTool("greet", greetDesc, greetHandler)
+
+	var callOrder []string
+	makeMiddleware := func(label string) ToolMiddleware {
+		return func(ctx context.Context, rawArgs json.RawMessage, next ExecuteFunc) (any, error) {
+			callOrder = append(callOrder, label+":before")
+			result, err := next(ctx, rawArgs)
+			callOrder = append(callOrder, label+":after")
+			return result, err
+		}
+	}
+
+	wrapped := Wrap(inner, makeMiddleware("A")).
+		Wrap(makeMiddleware("B"))
+
+	result, err := wrapped.Execute(context.Background(), json.RawMessage(`{"name":"Dave"}`))
+
+	require.NoError(t, err)
+	assert.Equal(t, "Hello, Dave", result)
+	assert.Equal(t, []string{"B:before", "A:before", "A:after", "B:after"}, callOrder)
+}
+
 func TestWrap_IsExecutableTool(t *testing.T) {
 	wrapped := Wrap(
 		NewTool("greet", greetDesc, greetHandler),

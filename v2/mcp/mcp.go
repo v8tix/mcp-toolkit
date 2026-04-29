@@ -1,8 +1,7 @@
 // Package mcp bridges the Model Context Protocol (MCP) SDK with the mcp-toolkit
-// ecosystem. It wraps MCP server tools as observable.Tools so they can be
-// registered in a registry.Registry and dispatched by the agent loop exactly
-// like any other tool — including retry and exponential backoff on transient
-// failures.
+// ecosystem. It adapts MCP server tools so they can be registered in a
+// registry.Registry and dispatched by the agent loop like any other tool.
+// Retry and exponential backoff are opt-in via the Builder's With* methods.
 //
 // Typical usage — register all tools discovered from an MCP server:
 //
@@ -44,7 +43,7 @@ type Session interface {
 // All observable.Option values are accepted directly.
 type Option = observable.Option
 
-// Builder constructs a single observable.Tool from an MCP tool and session.
+// Builder constructs a single tool from an MCP tool and session.
 // Create one with NewTool; chain WithMaxRetries, WithClassifier, or With before use.
 //
 //	tool := mcp.NewTool(discovered, session).WithMaxRetries(3)
@@ -74,6 +73,10 @@ func (b *Builder) resolve() observable.Tool {
 			def:     defFn(b.mcpTool),
 			session: b.session,
 			name:    b.mcpTool.Name,
+		}
+		if len(b.opts) == 0 {
+			b.built = raw
+			return
 		}
 		b.built = observable.Wrap(raw, b.opts...)
 	})
@@ -143,7 +146,7 @@ func (b *Builder) ExecuteRx(ctx context.Context, rawArgs json.RawMessage) rxgo.O
 }
 
 // NewTool returns a Builder for a single MCP tool.
-// Zero options applies production defaults (3 retries, exponential backoff).
+// Without any With* options, ExecuteRx performs a single attempt (no retry).
 //
 //	tool := mcp.NewTool(discovered[0], session)
 //	tool := mcp.NewTool(discovered[0], session).WithMaxRetries(5)
@@ -178,7 +181,7 @@ func (b *ToolsBuilder) With(opts ...Option) *ToolsBuilder {
 }
 
 // WithDefinition overrides the definition for all tools in the batch with a
-// static value. Use WithDefinitionFunc when you need per-tool customisation.
+// static value. Use WithDefinitionFunc when you need per-tool customization.
 func (b *ToolsBuilder) WithDefinition(def *sdkmcp.Tool) *ToolsBuilder {
 	nb := b.clone()
 	nb.definitionFn = func(_ *sdkmcp.Tool) *sdkmcp.Tool { return def }
@@ -199,9 +202,30 @@ func (b *ToolsBuilder) WithDefinitionFunc(fn func(*sdkmcp.Tool) *sdkmcp.Tool) *T
 func (b *ToolsBuilder) Build() []model.Tool {
 	result := make([]model.Tool, len(b.mcpTools))
 	for i, t := range b.mcpTools {
-		result[i] = &Builder{mcpTool: t, session: b.session, opts: b.opts, definitionFn: b.definitionFn}
+		result[i] = b.newBuilder(t)
 	}
 	return result
+}
+
+// BuildMap returns the tools as a map keyed by tool name, making per-tool
+// customization safe and index-free:
+//
+//	tools := mcp.NewTools(discovered, session).BuildMap()
+//	reg := registry.New(
+//		tools["tavily-search"].WithMaxRetries(5),
+//		tools["tavily-crawl"].WithMaxRetries(2),
+//		tools["tavily-map"],
+//	)
+func (b *ToolsBuilder) BuildMap() map[string]*Builder {
+	result := make(map[string]*Builder, len(b.mcpTools))
+	for _, t := range b.mcpTools {
+		result[t.Name] = b.newBuilder(t)
+	}
+	return result
+}
+
+func (b *ToolsBuilder) newBuilder(t *sdkmcp.Tool) *Builder {
+	return &Builder{mcpTool: t, session: b.session, opts: b.opts, definitionFn: b.definitionFn}
 }
 
 func (b *ToolsBuilder) clone(extra ...Option) *ToolsBuilder {
@@ -212,7 +236,7 @@ func (b *ToolsBuilder) clone(extra ...Option) *ToolsBuilder {
 }
 
 // NewTools returns a ToolsBuilder for a batch of MCP tools sharing a session.
-// Chain options then call Build to materialise the tools.
+// Chain options then call Build to materialize the tools.
 //
 //	reg := registry.New(mcp.NewTools(discovered, session).WithMaxRetries(0).Build()...)
 func NewTools(mcpTools []*sdkmcp.Tool, session Session) *ToolsBuilder {
@@ -228,7 +252,10 @@ type rawMCPTool struct {
 	name    string
 }
 
-var _ handler.ExecutableTool = (*rawMCPTool)(nil)
+var (
+	_ handler.ExecutableTool = (*rawMCPTool)(nil)
+	_ observable.Tool        = (*rawMCPTool)(nil)
+)
 
 func (t *rawMCPTool) Definition() *sdkmcp.Tool { return t.def }
 
@@ -261,12 +288,25 @@ func (t *rawMCPTool) Execute(ctx context.Context, rawArgs json.RawMessage) (any,
 	return text.Text, nil
 }
 
+func (t *rawMCPTool) ExecuteRx(ctx context.Context, rawArgs json.RawMessage) rxgo.Observable {
+	return rxgo.Defer([]rxgo.Producer{
+		func(_ context.Context, next chan<- rxgo.Item) {
+			result, err := t.Execute(ctx, rawArgs)
+			if err != nil {
+				next <- rxgo.Error(err)
+				return
+			}
+			next <- rxgo.Of(result)
+		},
+	})
+}
+
 // BuildDefinition returns the *sdkmcp.Tool to use as the tool definition.
 // When the input tool has a nil InputSchema, a default empty object schema is
-// set. Otherwise the tool is returned unchanged.
+// set. Otherwise, the tool is returned unchanged.
 //
 // Use this as a starting point inside WithDefinitionFunc to derive the default
-// definition and then customise it:
+// definition and then customize it:
 //
 //	mcp.NewTool(t, s).WithDefinitionFunc(func(t *sdkmcp.Tool) *sdkmcp.Tool {
 //	    cp := *t

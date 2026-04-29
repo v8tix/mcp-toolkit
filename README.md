@@ -490,17 +490,18 @@ import "github.com/v8tix/mcp-toolkit/v2/mcp"
 
 ---
 
-### Client — consume an MCP server's tools
+### Agent side — consume an MCP server's tools
 
-Wrap tools discovered from an MCP server as retry-aware `observable.Tool` objects and drop them into a registry:
+Adapt tools discovered from an MCP server and drop them into a registry:
 
 ```go
 session, _ := mcpClient.Connect(ctx, transport, nil)
 toolsResult, _ := session.ListTools(ctx, nil)
 
-// Zero options — production defaults (3 retries, exponential backoff).
 reg := registry.New(mcp.NewTools(toolsResult.Tools, session).Build()...)
 ```
+
+Without any `With*` options, the resulting tools execute with a single attempt and no retry wrapper. Add retry-related options only where you need them.
 
 #### `NewTool` — single tool builder
 
@@ -511,13 +512,27 @@ tool := mcp.NewTool(discovered, session)
 #### `NewTools` — batch builder
 
 ```go
-tools := mcp.NewTools(discovered, session).WithMaxRetries(0).Build()
+tools := mcp.NewTools(discovered, session).Build()
 reg := registry.New(tools...)
+```
+
+#### `BuildMap` — per-tool agent configuration
+
+Use `BuildMap` when your agent wants to apply different policies per remote tool name without relying on slice order:
+
+```go
+tools := mcp.NewTools(discovered, session).BuildMap()
+
+reg := registry.New(
+    tools["tavily-search"].WithMaxRetries(5),
+    tools["tavily-crawl"].WithMaxRetries(2),
+    tools["tavily-map"],
+)
 ```
 
 #### Builder options
 
-All builder methods return a new builder (immutable chaining). `sync.Once` lazy-resolves the final `observable.Tool` on first use.
+All builder methods return a new builder (immutable chaining). `sync.Once` lazy-resolves the final tool on first use. With no options, execution is a single attempt; once options are added, the builder resolves through `observable.Wrap`.
 
 | Method | Available on | Description |
 |---|---|---|
@@ -673,7 +688,7 @@ func main() {
 
 ---
 
-## Full example — consume MCP tools + retry + registry
+## Full example — agent consumes MCP tools
 
 ```go
 package main
@@ -695,14 +710,16 @@ func main() {
     session, _ := client.Connect(context.Background(), transport, nil)
 
     toolsResult, _ := session.ListTools(context.Background(), nil)
+    tools := mcp.NewTools(toolsResult.Tools, session).BuildMap()
 
     reg := registry.New(
-        mcp.NewTools(toolsResult.Tools, session).
-            WithMaxRetries(3).
+        tools["tavily-search"].
+            WithMaxRetries(5).
             With(observable.WithOnRetry(func(attempt uint64, err error) {
                 log.Printf("retry %d: %v", attempt, err)
-            })).
-            Build()...,
+            })),
+        tools["tavily-crawl"].WithMaxRetries(2),
+        tools["tavily-map"],
     )
 
     // Use reg.All() in your LLM request, reg.ByName() for dispatch.
